@@ -136,14 +136,10 @@ function getBA2Mods(payload, excludeModCondition) {
 function updateArchiveList(profile, api) {
   const state = api.store.getState();
   const gameId = profile.gameId;
+  const payload = { profile, state, gameId };
 
-  const payload = { profile, state, gameId }
-
-  // Get all enabled BA2s into a single array.
+  // 1. Get all BA2s from currently ENABLED mods
   const enabledBA2s = getBA2Mods(payload, (profile, modId) => profile.modState[modId].enabled);
-
-  // Get all disabled BA2s into a single array.
-  const disbledBA2s = getBA2Mods(payload, (profile, modId) => !profile.modState[modId].enabled);
 
   const gamePath = state.settings?.gameMode?.discovered?.[GAME_ID]?.path;
   if (!gamePath) return;
@@ -157,19 +153,21 @@ function updateArchiveList(profile, api) {
         ini.data.Archive = {};
       }
 
+      // 2. Read what's currently in the INI string
       const originalsResourceArchive2List = (ini.data.Archive.sResourceArchive2List || '')
         .split(',')
         .map(s => s.trim())
-        .filter(s => s);
+        .filter(Boolean);
 
-      // Remove ba2s from archive list if is marked as disabled
-      // This will allow for any user made changes to the sResourceArchive2List to be untouched
-      let filteredOriginalsResourceArchive2List = originalsResourceArchive2List.filter(e => !disbledBA2s.includes(e));
-
-      // Add to the filtered sResourceArchive2List the enabled mods, remove duplicates, and remove empty strings
-      const cleanedArchivesList = [...new Set([...enabledBA2s, ...filteredOriginalsResourceArchive2List])].filter(function (el) {
-        return !!el;
+      // 3. Filter the current INI entries strictly against enabled mods.
+      // This wipes out disabled mods, uninstalled mods, and any rogue manual entries.
+      const filteredOriginals = originalsResourceArchive2List.filter(archive => {
+        return enabledBA2s.includes(archive);
       });
+
+      // 4. Combine them cleanly (ensuring the final list reflects exactly what is active)
+      const cleanedArchivesList = [...new Set([...enabledBA2s, ...filteredOriginals])].filter(Boolean);
+
       ini.data.Archive.sResourceArchive2List = cleanedArchivesList.join(',');
       return parser.write(fallout76Custom, ini).then(() => Promise.resolve())
         .catch(err => log('error', 'Error updating Fallout76Custom.ini', err));
