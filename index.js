@@ -1,4 +1,6 @@
-const { actions, fs, util, selectors, log } = require('vortex-api');
+const { actions, fs, util, selectors, log, Toggle } = require('vortex-api');
+const React = require('react');
+const { connect } = require('react-redux');
 const Promise = require("bluebird");
 const winapi = require('winapi-bindings');
 const path = require('path');
@@ -12,6 +14,7 @@ const XBOX_ID = 'BethesdaSoftworks.Fallout76-PC';
 const ARCHIVE_EXT = '.ba2';
 const fallout76CustomINI = 'Fallout76Custom.ini';
 const iniPath = path.join(util.getVortexPath('documents'), 'My Games', 'Fallout 76');
+const SETTING_REMOVE_DISABLED = 'removeDisabledArchives';
 
 const tools = [
   {
@@ -22,6 +25,52 @@ const tools = [
     requiredFiles: []
   }
 ]
+
+// ============ Settings Reducer ============
+function settingsReducer(state, action) {
+  if (state === undefined) {
+    return { [SETTING_REMOVE_DISABLED]: true };
+  }
+  switch (action.type) {
+    case 'FO76_SET_REMOVE_DISABLED_ARCHIVES':
+      return util.setSafe(state, [SETTING_REMOVE_DISABLED], action.payload);
+    default:
+      return state;
+  }
+}
+
+// ============ Settings UI Component ============
+function SettingsBase({ removeDisabledArchives, onToggle }) {
+  return React.createElement('div', { style: { overflow: 'auto', padding: '15px 0' } },
+    React.createElement(Toggle, {
+      checked: removeDisabledArchives,
+      onToggle: onToggle,
+    }, 'Remove disabled mod archives from INI'),
+    React.createElement('p', { style: { marginTop: '5px' } },
+      'When enabled, .ba2 archives from disabled or uninstalled mods are removed from ',
+      React.createElement('code', null, 'sResourceArchive2List'),
+      ' in Fallout76Custom.ini. When disabled, only archives from enabled mods are added, ',
+      'but existing entries in the INI are preserved.'
+    )
+  );
+}
+
+function mapStateToProps(state) {
+  return {
+    removeDisabledArchives: util.getSafe(state,
+      ['settings', GAME_ID, SETTING_REMOVE_DISABLED], true),
+  };
+}
+
+function mapDispatchToProps(dispatch) {
+  return {
+    onToggle: (enabled) => dispatch({
+      type: 'FO76_SET_REMOVE_DISABLED_ARCHIVES', payload: enabled
+    }),
+  };
+}
+
+const Settings = connect(mapStateToProps, mapDispatchToProps)(SettingsBase);
 
 async function findGame() {
   return util.GameStoreHelper.findByAppId([STEAM_APP_ID, XBOX_ID])
@@ -137,6 +186,8 @@ function updateArchiveList(profile, api) {
   const state = api.store.getState();
   const gameId = profile.gameId;
   const payload = { profile, state, gameId };
+  const removeDisabledArchives = util.getSafe(state,
+    ['settings', GAME_ID, SETTING_REMOVE_DISABLED], true);
 
   // 1. Get all BA2s from currently ENABLED mods
   const enabledBA2s = getBA2Mods(payload, (profile, modId) => profile.modState[modId].enabled);
@@ -159,14 +210,22 @@ function updateArchiveList(profile, api) {
         .map(s => s.trim())
         .filter(Boolean);
 
-      // 3. Filter the current INI entries strictly against enabled mods.
-      // This wipes out disabled mods, uninstalled mods, and any rogue manual entries.
-      const filteredOriginals = originalsResourceArchive2List.filter(archive => {
-        return enabledBA2s.includes(archive);
-      });
+      let cleanedArchivesList;
 
-      // 4. Combine them cleanly (ensuring the final list reflects exactly what is active)
-      const cleanedArchivesList = [...new Set([...enabledBA2s, ...filteredOriginals])].filter(Boolean);
+      if (removeDisabledArchives) {
+        // 3a. Strict mode: Filter the current INI entries against enabled mods only.
+        // This removes disabled mods, uninstalled mods, and any manual entries not from enabled mods.
+        const filteredOriginals = originalsResourceArchive2List.filter(archive => {
+          return enabledBA2s.includes(archive);
+        });
+        cleanedArchivesList = [...new Set([...enabledBA2s, ...filteredOriginals])].filter(Boolean);
+      } else {
+        // 3b. Permissive mode: Only remove BA2s from explicitly disabled mods,
+        // preserving any other manual entries in the INI.
+        const disabledBA2s = getBA2Mods(payload, (profile, modId) => !profile.modState[modId].enabled);
+        const filteredOriginals = originalsResourceArchive2List.filter(e => !disabledBA2s.includes(e));
+        cleanedArchivesList = [...new Set([...enabledBA2s, ...filteredOriginals])].filter(Boolean);
+      }
 
       ini.data.Archive.sResourceArchive2List = cleanedArchivesList.join(',');
       return parser.write(fallout76Custom, ini).then(() => Promise.resolve())
@@ -238,6 +297,10 @@ function findExecutable(discoveryPath) {
 
 function main(context) {
   context.requireVersion('>=1.2.0');
+
+  // Register reducer FIRST for settings persistence
+  context.registerReducer(['settings', GAME_ID], settingsReducer);
+
   context.registerGame({
     id: GAME_ID,
     name: 'Fallout 76',
@@ -262,6 +325,12 @@ function main(context) {
 
   // Migrate from a version below 2.0.0 - not tested but it should work. 
   context.registerMigration(old => migrate200(context.api, old));
+
+  // Register settings panel (visible only when FO76 is the active game)
+  context.registerSettings('Mods', Settings, undefined, () => {
+    const state = context.api.getState();
+    return selectors.activeGameId(state) === GAME_ID;
+  }, 150);
 
   context.once(() => {
     const state = context.api.store.getState();
