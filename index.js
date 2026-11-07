@@ -142,9 +142,37 @@ function createINI(iniLocation, api) {
     });
 }
 
+function sanitizeDestination(file) {
+  // Normalize leading slashes/backslashes
+  let clean = file.replace(/^[\\/]+/, '');
+
+  // Strip leading "Data/" or "Data\\" folders (case-insensitive), repeating if nested (e.g. Data/Data/)
+  while (/^data[\\/]/i.test(clean)) {
+    clean = clean.replace(/^data[\\/]/i, '');
+  }
+
+  // Handle case where a wrapper folder wraps Data/, e.g. "ModFolder/Data/..."
+  const wrapperMatch = clean.match(/^([^\\/]+)[\\/]data[\\/](.*)$/i);
+  if (wrapperMatch) {
+    const topFolder = wrapperMatch[1].toLowerCase();
+    const standardDataDirs = [
+      'interface', 'meshes', 'music', 'scripts', 'sound',
+      'strings', 'textures', 'materials', 'programs', 'video', 'vis'
+    ];
+    if (!standardDataDirs.includes(topFolder)) {
+      clean = wrapperMatch[2];
+      while (/^data[\\/]/i.test(clean)) {
+        clean = clean.replace(/^data[\\/]/i, '');
+      }
+    }
+  }
+
+  return clean;
+}
+
 function testForArchives(files, gameId) {
-  // Is this a Fallout 76 mod that includes BA2 files?
-  const supported = (gameId === GAME_ID) && (files.find(file => path.extname(file).toLowerCase() === ARCHIVE_EXT) !== undefined);
+  // Supported for Fallout 76 mods
+  const supported = (gameId === GAME_ID);
 
   return Promise.resolve({
     supported,
@@ -156,12 +184,23 @@ function installAndRegisterArchives(files) {
   let instructions = [];
 
   // Get an array of the file names of the ba2 files (in case they're nested for some reason)    
-  const ba2Files = files.filter(f => path.extname(f).toLowerCase() === ARCHIVE_EXT).map(a => path.basename(a));
+  const ba2Files = [...new Set(files.filter(f => path.extname(f).toLowerCase() === ARCHIVE_EXT).map(a => path.basename(a)))];
   // Add this attribute to the mod when we install it. 
   if (ba2Files.length) instructions.push({ type: 'attribute', key: 'ba2archives', value: ba2Files });
 
-  // A basic install pattern just to ensure the files are still copied over. 
-  const fileInstructions = files.map(f => { return { type: 'copy', source: f, destination: f } });
+  // Map file copy instructions, stripping any top-level Data/ folder so files land directly in Data/
+  const fileInstructions = files.reduce((accum, f) => {
+    // Skip directory entries
+    if (f.endsWith('/') || f.endsWith('\\')) return accum;
+
+    const destination = sanitizeDestination(f);
+
+    // If destination is empty or just 'data', skip
+    if (!destination || destination.toLowerCase() === 'data') return accum;
+
+    accum.push({ type: 'copy', source: f, destination });
+    return accum;
+  }, []);
 
   // Combine the attributes and instructions, then return.
   instructions = instructions.concat(fileInstructions);
