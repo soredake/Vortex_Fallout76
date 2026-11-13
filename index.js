@@ -27,17 +27,16 @@ const tools = [
 ]
 
 // ============ Settings Reducer ============
-function settingsReducer(state, action) {
-  if (state === undefined) {
-    return { [SETTING_REMOVE_DISABLED]: true };
-  }
-  switch (action.type) {
-    case 'FO76_SET_REMOVE_DISABLED_ARCHIVES':
-      return util.setSafe(state, [SETTING_REMOVE_DISABLED], action.payload);
-    default:
-      return state;
-  }
-}
+// Vortex expects an IReducerSpec ({ reducers, defaults }), not a classic
+// (state, action) reducer function - a plain function is silently ignored,
+// which made the settings toggle appear dead.
+const settingsReducer = {
+  reducers: {
+    'FO76_SET_REMOVE_DISABLED_ARCHIVES': (state, payload) =>
+      util.setSafe(state, [SETTING_REMOVE_DISABLED], payload),
+  },
+  defaults: { [SETTING_REMOVE_DISABLED]: true },
+};
 
 // ============ Settings UI Component ============
 function SettingsBase({ removeDisabledArchives, onToggle }) {
