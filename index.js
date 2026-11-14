@@ -12,6 +12,11 @@ const GAME_ID = 'fallout76';
 const STEAM_APP_ID = '1151340';
 const XBOX_ID = 'BethesdaSoftworks.Fallout76-PC';
 const ARCHIVE_EXT = '.ba2';
+// Subfolders of Data/ whose files must keep their subfolder structure
+const STANDARD_DATA_DIRS = [
+  'interface', 'meshes', 'music', 'scripts', 'sound',
+  'strings', 'textures', 'materials', 'programs', 'video', 'vis'
+];
 const fallout76CustomINI = 'Fallout76Custom.ini';
 const iniPath = path.join(util.getVortexPath('documents'), 'My Games', 'Fallout 76');
 const SETTING_REMOVE_DISABLED = 'removeDisabledArchives';
@@ -154,11 +159,7 @@ function sanitizeDestination(file) {
   const wrapperMatch = clean.match(/^([^\\/]+)[\\/]data[\\/](.*)$/i);
   if (wrapperMatch) {
     const topFolder = wrapperMatch[1].toLowerCase();
-    const standardDataDirs = [
-      'interface', 'meshes', 'music', 'scripts', 'sound',
-      'strings', 'textures', 'materials', 'programs', 'video', 'vis'
-    ];
-    if (!standardDataDirs.includes(topFolder)) {
+    if (!STANDARD_DATA_DIRS.includes(topFolder)) {
       clean = wrapperMatch[2];
       while (/^data[\\/]/i.test(clean)) {
         clean = clean.replace(/^data[\\/]/i, '');
@@ -167,6 +168,40 @@ function sanitizeDestination(file) {
   }
 
   return clean;
+}
+
+/**
+ * Detects a single top-level wrapper folder (e.g. "SmootherFishing/SmootherFishing.ba2"),
+ * where the whole mod lives inside one folder that is neither "Data" nor a standard
+ * Data subfolder (interface, meshes, ...). Returns the normalized folder name to strip,
+ * or undefined if the archive doesn't match this layout.
+ */
+function detectWrapperFolder(files) {
+  const isDir = (f) => f.endsWith('/') || f.endsWith('\\');
+
+  const topLevel = new Set();
+  for (const f of files) {
+    if (isDir(f)) continue;
+    const normalized = f.replace(/\\/g, '/');
+    const sepIdx = normalized.indexOf('/');
+    if (sepIdx === -1) continue; // files at the archive root stay at the root
+    topLevel.add(normalized.slice(0, sepIdx).toLowerCase());
+  }
+
+  if (topLevel.size !== 1) return undefined;
+
+  const wrapper = [...topLevel][0];
+  if (wrapper === 'data' || STANDARD_DATA_DIRS.includes(wrapper)) return undefined;
+
+  return wrapper;
+}
+
+// Strips a leading "<wrapper>/" or "<wrapper>\\" segment, if present
+function stripWrapperFolder(file, wrapper) {
+  if (!wrapper) return file;
+  const normalized = file.replace(/\\/g, '/');
+  if (!normalized.toLowerCase().startsWith(wrapper + '/')) return file;
+  return normalized.slice(wrapper.length + 1);
 }
 
 function testForArchives(files, gameId) {
@@ -187,12 +222,17 @@ function installAndRegisterArchives(files) {
   // Add this attribute to the mod when we install it. 
   if (ba2Files.length) instructions.push({ type: 'attribute', key: 'ba2archives', value: ba2Files });
 
+  // Handle archives whose content lives inside a single wrapper folder with no Data/
+  // folder in it (e.g. "SmootherFishing/SmootherFishing.ba2"): treat that folder as
+  // the mod root so its contents land directly in the game's Data/ folder.
+  const wrapper = detectWrapperFolder(files);
+
   // Map file copy instructions, stripping any top-level Data/ folder so files land directly in Data/
   const fileInstructions = files.reduce((accum, f) => {
     // Skip directory entries
     if (f.endsWith('/') || f.endsWith('\\')) return accum;
 
-    const destination = sanitizeDestination(f);
+    const destination = sanitizeDestination(stripWrapperFolder(f, wrapper));
 
     // If destination is empty or just 'data', skip
     if (!destination || destination.toLowerCase() === 'data') return accum;
