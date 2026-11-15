@@ -175,9 +175,16 @@ function sanitizeDestination(file) {
  * where the whole mod lives inside one folder that is neither "Data" nor a standard
  * Data subfolder (interface, meshes, ...). Returns the normalized folder name to strip,
  * or undefined if the archive doesn't match this layout.
+ *
+ * A top-level folder is only treated as a removable wrapper when its root level
+ * looks like a mod root: a content file (.ba2/.esm/.cdx/.ini) directly inside it
+ * or a standard Data subfolder under it. Folders that only contain non-standard
+ * subfolders are functional runtime directories (e.g. XSCAL/Plugins/... which the
+ * XSCAL loader expects at Data\\XSCAL\\Plugins) and must be kept.
  */
 function detectWrapperFolder(files) {
   const isDir = (f) => f.endsWith('/') || f.endsWith('\\');
+  const MOD_ROOT_EXTENSIONS = ['.ba2', '.esm', '.cdx', '.ini'];
 
   const topLevel = new Set();
   for (const f of files) {
@@ -193,7 +200,19 @@ function detectWrapperFolder(files) {
   const wrapper = [...topLevel][0];
   if (wrapper === 'data' || STANDARD_DATA_DIRS.includes(wrapper)) return undefined;
 
-  return wrapper;
+  for (const f of files) {
+    if (isDir(f)) continue;
+    const parts = f.replace(/\\/g, '/').split('/');
+    if (parts[0].toLowerCase() !== wrapper) continue;
+    if (parts.length === 2 && MOD_ROOT_EXTENSIONS.includes(path.extname(parts[1]).toLowerCase())) {
+      return wrapper;
+    }
+    if (parts.length > 2 && STANDARD_DATA_DIRS.includes(parts[1].toLowerCase())) {
+      return wrapper;
+    }
+  }
+
+  return undefined;
 }
 
 // Strips a leading "<wrapper>/" or "<wrapper>\\" segment, if present
