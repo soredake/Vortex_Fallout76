@@ -21,11 +21,28 @@ jobs:
         run: |
           info_version=$(node -p "require('./info.json').version")
           tag="${GITHUB_REF_NAME#v}"
-          if [ "$info_version" != "$tag" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "$info_version" != "$tag" ]; then
             echo "::error::Tag v$tag does not match info.json version $info_version"
             exit 1
           fi
           echo "version=$info_version" >> "$GITHUB_ENV"
+
+      - name: Resolve release tag
+        id: tags
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            release_tag="v${version}"
+            if ! git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null; then
+              git tag "$release_tag"
+              git push origin "$release_tag"
+            fi
+          fi
+          # A missing previous tag (first release ever) must not fatal the job.
+          prev_tag=$(git describe --tags --abbrev=0 "$release_tag^" 2>/dev/null || true)
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=$prev_tag" >> "$GITHUB_OUTPUT"
 
       - name: Package extension zip
         run: |
@@ -34,9 +51,12 @@ jobs:
 
       - name: Build Changelog
         id: build_changelog
+        if: steps.tags.outputs.prev_tag != ''
         uses: mikepenz/release-changelog-builder-action@v6
         with:
           mode: "COMMIT"
+          fromTag: ${{ steps.tags.outputs.prev_tag }}
+          toTag: ${{ steps.tags.outputs.release_tag }}
           configurationJson: |
             {
               "template": "#{{CHANGELOG}}\n\n<details>\n<summary>Full commit range</summary>\n\n#{{UNCATEGORIZED}}\n</details>",
@@ -75,10 +95,22 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Prepare release notes
+        env:
+          GENERATED: ${{ steps.build_changelog.outputs.changelog }}
+        run: |
+          if [ -n "$GENERATED" ]; then
+            printf '%s\n' "$GENERATED" > release-notes.md
+          else
+            # First release ever: no previous tag to diff against.
+            git log --pretty='- %s' "${{ steps.tags.outputs.release_tag }}" > release-notes.md
+          fi
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          name: v${{ env.version }}
-          body: ${{ steps.build_changelog.outputs.changelog }}
+          tag_name: ${{ steps.tags.outputs.release_tag }}
+          name: ${{ steps.tags.outputs.release_tag }}
+          body_path: release-notes.md
           files: Vortex_Fallout76-${{ env.version }}.zip
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(steps.tags.outputs.release_tag, '-') }}
