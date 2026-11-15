@@ -508,4 +508,6 @@ function migrate200(api, oldVersion) {
 
 module.exports = {
   default: main,
+  // Exposed for the automated install-layout tests (test/); not used by Vortex.
+  _installPaths: { sanitizeDestination, detectWrapperFolder, stripWrapperFolder },
 };
