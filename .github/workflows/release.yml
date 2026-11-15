@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag matches info.json version
+        run: |
+          info_version=$(node -p "require('./info.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$info_version" != "$tag" ] && [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::Tag v$tag does not match info.json version $info_version"
+            exit 1
+          fi
+          echo "version=$info_version" >> "$GITHUB_ENV"
+
+      - name: Package extension zip
+        run: |
+          zip -r "Vortex_Fallout76-${version}.zip" \
+            index.js info.json assets LICENSE README.md
+
+      - name: Build Changelog
+        id: build_changelog
+        uses: mikepenz/release-changelog-builder-action@v6
+        with:
+          mode: "COMMIT"
+          configurationJson: |
+            {
+              "template": "#{{CHANGELOG}}\n\n<details>\n<summary>Full commit range</summary>\n\n#{{UNCATEGORIZED}}\n</details>",
+              "pr_template": "",
+              "commit_template": "- #{{TITLE}} (#{{HASH}})\n",
+              "categories": [
+                { "title": "## ✨ Added", "labels": ["feature"] },
+                { "title": "## 🐛 Fixed", "labels": ["fix"] },
+                { "title": "## 💥 Breaking", "labels": ["breaking"] },
+                { "title": "## 📝 Other changes", "labels": ["other"] }
+              ],
+              "label_extractor": [
+                {
+                  "pattern": "^(?i:add|feat|implement|introduce|support|allow|strip|keep|ensure)\\b",
+                  "on_property": "title",
+                  "target": "feature"
+                },
+                {
+                  "pattern": "^(?i:fix|bug|resolve|correct|repair|patch|improve|handle|avoid)\\b",
+                  "on_property": "title",
+                  "target": "fix"
+                },
+                {
+                  "pattern": "^(?i:break|remove|drop|rename|rework)\\b",
+                  "on_property": "title",
+                  "target": "breaking"
+                },
+                {
+                  "pattern": ".+",
+                  "on_property": "title",
+                  "target": "other"
+                }
+              ],
+              "ignorePreReleases": true
+            }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ env.version }}
+          body: ${{ steps.build_changelog.outputs.changelog }}
+          files: Vortex_Fallout76-${{ env.version }}.zip
+          prerelease: ${{ contains(github.ref_name, '-') }}
