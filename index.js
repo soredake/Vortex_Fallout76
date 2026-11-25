@@ -20,6 +20,8 @@ const STANDARD_DATA_DIRS = [
 const fallout76CustomINI = 'Fallout76Custom.ini';
 const iniPath = path.join(util.getVortexPath('documents'), 'My Games', 'Fallout 76');
 const SETTING_REMOVE_DISABLED = 'removeDisabledArchives';
+// Widget names of uninstalled mods that must stay out of Data/hudmodloader.ini
+const SETTING_HUDMODLOADER_PRUNED = 'hudModLoaderPrunedLines';
 
 const tools = [
   {
@@ -39,8 +41,13 @@ const settingsReducer = {
   reducers: {
     'FO76_SET_REMOVE_DISABLED_ARCHIVES': (state, payload) =>
       util.setSafe(state, [SETTING_REMOVE_DISABLED], payload),
+    'FO76_SET_HUDMODLOADER_PRUNED': (state, payload) =>
+      util.setSafe(state, [SETTING_HUDMODLOADER_PRUNED], payload),
   },
-  defaults: { [SETTING_REMOVE_DISABLED]: true },
+  defaults: {
+    [SETTING_REMOVE_DISABLED]: true,
+    [SETTING_HUDMODLOADER_PRUNED]: [],
+  },
 };
 
 // ============ Settings UI Component ============
@@ -97,12 +104,12 @@ function onGameModeActivated(gameId, api) {
   if (gameId !== GAME_ID) return;
   const ini = path.join(iniPath, fallout76CustomINI)
 
-  const refreshArchives = () => {
+  const refreshIniFiles = () => {
     const state = api.store.getState();
     const profileId = selectors.activeProfileId(state);
     const profile = state.persistent.profiles[profileId];
     if (profile && profile.gameId === GAME_ID) {
-      updateArchiveList(profile, api);
+      updateManagedIniFiles(profile, api);
     }
   };
 
@@ -112,14 +119,14 @@ function onGameModeActivated(gameId, api) {
       // See if our INI exists
       return fs.statAsync(ini)
         .then(() => {
-          refreshArchives();
+          refreshIniFiles();
           return ini;
         })
         .catch(err => {
           // If the INI doesn't exist, make one.
           if (err.code === 'ENOENT') {
             return createINI(ini, api).then((createdIni) => {
-              if (createdIni) refreshArchives();
+              if (createdIni) refreshIniFiles();
               return createdIni;
             });
           }
@@ -331,6 +338,372 @@ function updateArchiveList(profile, api) {
     .catch(err => log('error', 'Error parsing Fallout76Custom.ini', err));
 }
 
+// ============================================================================
+// HUDModLoader support
+// ============================================================================
+// HUDModLoader (Fallout 76 Nexus mod 3144) is a HUD framework: it loads every
+// HUD widget whose name is listed in the game's Data/hudmodloader.ini. The file
+// is a plain list, one widget name per line and no section headers:
+//
+//     BuffsMeter
+//     EventNotifications
+//     HUDCondition
+//
+// A HUD mod installed through Vortex does not add itself to that file, so the
+// user has to edit it by hand. This extension maintains the file instead:
+//   * a mod that is installed and enabled gets its widget name added (once),
+//   * a mod that is uninstalled gets its widget name removed again.
+// Lines this table knows nothing about - widget names HUDModLoader ships for mods
+// that are not installed, entries added by hand, other HUD loaders - are never
+// touched, so a manual setup keeps working.
+//
+// There is no generic way to know which widget name a mod provides (the author
+// picks it and only the mod's own scripts reference it), so the mapping is
+// defined once, below, and only needs extending when a new HUD mod is released.
+
+const HUDMODLOADER_INI = 'hudmodloader.ini';
+
+/**
+ * Widget names (hudmodloader.ini lines) per mod.
+ *
+ * line: the widget name exactly as HUDModLoader expects it in the ini.
+ * mods: any names the mod can be known by. A mod is known under several names -
+ *       its Nexus title, the archive it came in, a name the user gave it - so
+ *       the names here are matched loosely: case and punctuation are ignored and
+ *       a substring match is used (see hudLinesForMod below).
+ *       A mod that ships several widgets has one entry per widget.
+ *
+ * To support a new HUD mod, add its widget name and mod names to this table.
+ */
+const HUDMODLOADER_ENTRIES = [
+  // Widgets listed as officially supported by HUDModLoader
+  { line: 'BuffsMeter', mods: ['Buffs Meter'] },
+  { line: 'CompatibleShowHealthRedux', mods: ['Compatible Show Health Redux'] },
+  { line: 'CompatibleWeightIndicator', mods: ['Compatible Weight Indicator'] },
+  { line: 'CustomCrosshair', mods: ['Custom Crosshair'] },
+  { line: 'CustomRadios', mods: ['Custom Radios'] },
+  { line: 'DPSMeter', mods: ['Simple DPS Meter', 'DPS Meter'] },
+  { line: 'DynamicPingAudio', mods: ['Dynamic Ping Audio'] },
+  { line: 'EventNotifications', mods: ['Event Notifications'] },
+  { line: 'FFHudMenu', mods: ['Fanfare Free'] },
+  { line: 'HUDChallenges', mods: ['HUD Challenges'] },
+  { line: 'HUDCondition', mods: ['HUD Condition'] },
+  { line: 'HUDEditor', mods: ['HUD Editor'] },
+  { line: 'HUDPlayerList', mods: ['HUD Server Player List', 'HUD Player List'] },
+  { line: 'ImprovedHealthBars', mods: ['Improved Health Bars', 'Improved HP'] },
+  { line: 'KillStreakTimer', mods: ['Kill Streak Timer'] },
+  { line: 'PLMHudMenu', mods: ['Perk Loadout Manager'] },
+  { line: 'PickUpHistory', mods: ['Pick Up History'] },
+  { line: 'StatsMeter', mods: ['Simple Stats Meter', 'Stats Meter'] },
+  { line: 'VATSPriority', mods: ['V.A.T.S. Priority', 'VATS Priority'] },
+  { line: 'VendorLog', mods: ['Vendor Log'] },
+
+  // "Improved Bars and HUD" ships several widgets in a single mod, so it shows
+  // up in one entry per widget and all of its names are added together.
+  { line: 'ImprovedBars', mods: ['Improved Bars and HUD', 'Improved HUD', 'Improved Bars'] },
+  { line: 'GlowPercent', mods: ['Improved Bars and HUD', 'Improved HUD'] },
+  { line: 'HudBarPercentWidgets', mods: ['Improved Bars and HUD', 'Improved HUD'] },
+
+  // Deliberately not mapped: FCMChatWidget and FCMServerBridge belong to
+  // "Fallout Chat Mod" as alternative packages of one mod (the mod page says to
+  // install only one of them). Matching the mod would add both names, which the
+  // mod forbids, so their lines are simply left untouched.
+];
+
+// "HUD Condition - Armor and weapon" -> "hudconditionarmorandweapon".
+// Used so names match regardless of case, spaces, dots and dashes.
+function normalizeHudName(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * All names a single mod can be known by, used to match it against
+ * HUDMODLOADER_ENTRIES.
+ */
+function getModNameCandidates(mod) {
+  const attributes = (mod && mod.attributes) || {};
+
+  const candidates = [
+    attributes.customFileName,   // name the user gave the mod in Vortex
+    attributes.logicalFileName,  // name Vortex derived from the download
+    attributes.modName,
+    attributes.name,
+    mod && mod.installationPath, // staging folder, e.g. "Event Notifications 4104 1.0.5 ..."
+  ];
+
+  // Every archive this extension saw while installing the mod (see
+  // installAndRegisterArchives). HUD mods usually ship one .ba2 named after the
+  // widget it loads - "EventNotifications.ba2" - which is a very reliable match.
+  for (const archive of attributes.ba2archives || []) {
+    candidates.push(path.basename(archive, path.extname(archive)));
+  }
+
+  return candidates.filter(c => (typeof c === 'string') && (c.length > 0));
+}
+
+/**
+ * The hudmodloader.ini widget names a single mod needs.
+ *
+ * Matching is a substring test on normalized names. The aliases in
+ * HUDMODLOADER_ENTRIES are specific enough that a false positive is not a
+ * concern in practice, and an extra widget name in the ini only makes
+ * HUDModLoader look for a widget that is not installed, which it ignores.
+ */
+function hudLinesForMod(mod) {
+  const names = getModNameCandidates(mod).map(normalizeHudName).filter(Boolean);
+  if (names.length === 0) return [];
+
+  const lines = [];
+  for (const entry of HUDMODLOADER_ENTRIES) {
+    const aliases = [entry.line].concat(entry.mods).map(normalizeHudName);
+    const matches = aliases.some(alias => names.some(name => name.includes(alias)));
+    if (matches) lines.push(entry.line);
+  }
+  return lines;
+}
+
+/**
+ * Widget names required by all mods that are installed *and* enabled in the
+ * given profile.
+ */
+function getRequiredHudLines(state, profile) {
+  const mods = util.getSafe(state, ['persistent', 'mods', GAME_ID], {});
+  const modState = (profile && profile.modState) || {};
+  const lines = [];
+
+  for (const modId of Object.keys(modState)) {
+    if (!modState[modId] || !modState[modId].enabled) continue;
+    // modState can outlive the mod record (uninstalled mod) - nothing to add then
+    const mod = mods[modId];
+    if (!mod) continue;
+    for (const line of hudLinesForMod(mod)) {
+      if (!lines.includes(line)) lines.push(line);
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * Splits a hudmodloader.ini into lines while remembering how it was formatted,
+ * so rewriting it does not change the user's line endings or add/remove a BOM.
+ */
+function readHudIni(content) {
+  const hasBom = content.charCodeAt(0) === 0xFEFF;
+  const body = hasBom ? content.slice(1) : content;
+  const lines = body.length > 0 ? body.split(/\r?\n/) : [];
+  const endsWithNewline = body.endsWith('\n');
+  // A trailing newline produces an empty last element, which is not a line
+  if (endsWithNewline) lines.pop();
+
+  return {
+    hasBom,
+    eol: body.includes('\r\n') ? '\r\n' : '\n',
+    endsWithNewline,
+    lines,
+  };
+}
+
+function writeHudIni(doc, lines) {
+  const body = lines.join(doc.eol)
+    + ((doc.endsWithNewline && (lines.length > 0)) ? doc.eol : '');
+  return (doc.hasBom ? '\uFEFF' : '') + body;
+}
+
+/**
+ * Adds widget names that are not in the file yet. Everything already in the
+ * file - lines HUDModLoader ships itself, lines the user added, duplicates - is
+ * left exactly as it was, so a name is never listed twice.
+ *
+ * Pure function, which lets the behaviour be tested outside Vortex (test/).
+ */
+function addHudLines(content, linesToAdd) {
+  const doc = readHudIni(content);
+  const present = new Set(doc.lines.map(normalizeHudName));
+  const added = [];
+
+  for (const line of linesToAdd) {
+    const key = normalizeHudName(line);
+    if (!key || present.has(key)) continue;
+    doc.lines.push(line);
+    present.add(key);
+    added.push(line);
+  }
+
+  return { content: added.length ? writeHudIni(doc, doc.lines) : content, added };
+}
+
+/**
+ * Removes the given widget names from the file. Lines that are not in the given
+ * list (widget names this extension does not know about, manual additions) are
+ * preserved untouched.
+ *
+ * Pure function, which lets the behaviour be tested outside Vortex (test/).
+ */
+function removeHudLines(content, linesToRemove) {
+  const doc = readHudIni(content);
+  const targets = new Set(linesToRemove.map(normalizeHudName));
+  const removed = [];
+
+  const kept = doc.lines.filter(line => {
+    if (!targets.has(normalizeHudName(line))) return true;
+    removed.push(line.trim());
+    return false;
+  });
+
+  return { content: removed.length ? writeHudIni(doc, kept) : content, removed };
+}
+
+/**
+ * Brings the widget list in line with the installed mods: adds the names of
+ * enabled mods and drops the names of uninstalled ones.
+ *
+ * `prunedLines` are the names remembered for uninstalled mods (see
+ * captureHudLinesForRemoval). A name that is required again - the mod was
+ * reinstalled - is not pruned.
+ *
+ * Pure function, which lets the behaviour be tested outside Vortex (test/).
+ */
+function reconcileHudLines(content, requiredLines, prunedLines) {
+  const required = new Set(requiredLines.map(normalizeHudName));
+  const toRemove = prunedLines.filter(line => !required.has(normalizeHudName(line)));
+
+  const removedResult = removeHudLines(content, toRemove);
+  const addedResult = addHudLines(removedResult.content, requiredLines);
+
+  return {
+    content: addedResult.content,
+    added: addedResult.added,
+    removed: removedResult.removed,
+  };
+}
+
+/** Data/hudmodloader.ini of the managed game installation, if known. */
+function hudModLoaderIniPath(state) {
+  const gamePath = util.getSafe(state,
+    ['settings', 'gameMode', 'discovered', GAME_ID, 'path'], undefined);
+  // HUDModLoader keeps both its .ba2 and its ini in the game's Data folder
+  return gamePath ? path.join(gamePath, 'Data', HUDMODLOADER_INI) : undefined;
+}
+
+/**
+ * Reads Data/hudmodloader.ini, hands its content to `edit` and writes the result
+ * back if it actually changed. Returns whatever `edit` returned, so the caller
+ * can report what was added/removed.
+ *
+ * The file is only touched when it exists: HUDModLoader (or the user) creates
+ * it, so a missing file means the loader is not installed or not deployed and
+ * there is nothing to manage here.
+ */
+async function editHudModLoaderIni(api, edit) {
+  const state = api.store.getState();
+  const iniFile = hudModLoaderIniPath(state);
+  if (!iniFile) return undefined;
+
+  let content;
+  try {
+    content = await fs.readFileAsync(iniFile, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      log('error', `Could not read ${HUDMODLOADER_INI}`, err);
+    }
+    return undefined;
+  }
+
+  const result = edit(content);
+  if (result.content !== content) {
+    try {
+      await fs.writeFileAsync(iniFile, result.content, 'utf8');
+    } catch (err) {
+      log('error', `Could not update ${HUDMODLOADER_INI}`, err);
+      api.sendNotification({
+        id: 'fallout76-hudmodloader-error',
+        type: 'error',
+        title: `Could not update ${HUDMODLOADER_INI}`,
+        message: `${err.code} - ${err.message}`,
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Widget names of mods that were uninstalled. HUDModLoader ships its ini with a
+ * line for every mod it supports, and a deployment copies that file into the game
+ * folder again, so a name would come back with the next deployment if it was
+ * only deleted once. Keeping the name here makes the removal stick until the mod
+ * is installed again.
+ */
+function getPrunedHudLines(state) {
+  return util.getSafe(state, ['settings', GAME_ID, SETTING_HUDMODLOADER_PRUNED], []);
+}
+
+/**
+ * Makes sure every installed and enabled mod this extension knows about is
+ * listed in Data/hudmodloader.ini, and that uninstalled ones are not.
+ *
+ * Runs on startup, when the profile changes and after a deployment (a deployment
+ * overwrites the file with the copy that ships with HUDModLoader).
+ */
+async function updateHudModLoaderIni(profile, api) {
+  if (!profile || profile.gameId !== GAME_ID) return;
+
+  const state = api.store.getState();
+  const requiredLines = getRequiredHudLines(state, profile);
+  const prunedLines = getPrunedHudLines(state);
+
+  const result = await editHudModLoaderIni(
+    api, content => reconcileHudLines(content, requiredLines, prunedLines));
+
+  if (result && (result.added.length > 0)) {
+    log('info', `Added HUD mod(s) to ${HUDMODLOADER_INI}: ${result.added.join(', ')}`);
+  }
+  if (result && (result.removed.length > 0)) {
+    log('info', `Removed HUD mod(s) from ${HUDMODLOADER_INI}: ${result.removed.join(', ')}`);
+  }
+}
+
+/**
+ * "will-remove-mod": remember the widget names of the mod Vortex is about to
+ * uninstall. The mod record is gone once the removal has finished, so this has
+ * to happen while the mod still exists.
+ */
+function captureHudLinesForRemoval(gameId, modId, removeOpts, api) {
+  if (gameId !== GAME_ID) return;
+  // A reinstall/update ("will be replaced") keeps the mod, only its files change
+  if (removeOpts && removeOpts.willBeReplaced) return;
+
+  const state = api.store.getState();
+  const mod = util.getSafe(state, ['persistent', 'mods', GAME_ID, modId], undefined);
+  if (!mod) return;
+
+  const lines = hudLinesForMod(mod);
+  if (lines.length === 0) return;
+
+  // Stored in the extension settings so it survives a Vortex restart
+  const remembered = [...new Set(getPrunedHudLines(state).concat(lines))];
+  api.store.dispatch({ type: 'FO76_SET_HUDMODLOADER_PRUNED', payload: remembered });
+}
+
+/** The profile of the active game, if Fallout 76 is the game being managed. */
+function getActiveGameProfile(state) {
+  const profileId = selectors.activeProfileId(state);
+  const profile = util.getSafe(state, ['persistent', 'profiles', profileId], undefined);
+  return (profile && (profile.gameId === GAME_ID)) ? profile : undefined;
+}
+
+/**
+ * Refreshes everything this extension maintains for the game:
+ * the archive list in Fallout76Custom.ini (Documents) and the HUDModLoader
+ * widget list in Data/hudmodloader.ini (game folder).
+ */
+function updateManagedIniFiles(profile, api) {
+  return Promise.all([
+    updateArchiveList(profile, api),
+    updateHudModLoaderIni(profile, api),
+  ]);
+}
 
 /**
  * Using the onStateChange props, this function checks for the profile that has changed and returns it
@@ -353,14 +726,14 @@ function getChangedProfile(previous, current) {
 
 let debounceUpdate = setTimeout(() => { }, 0);
 
-function debouncedUpdateArchiveList(previous, current, api) {
+function debouncedUpdateIniFiles(previous, current, api) {
   const changedProfile = getChangedProfile(previous, current)
   // Ensure that the profile, the modstate and the gameid are correct
   if (!changedProfile || !changedProfile.modState || changedProfile.gameId !== GAME_ID) {
     // Return if no profile, or the profile is not for FO76
     return
   }
-  updateArchiveList(changedProfile, api)
+  updateManagedIniFiles(changedProfile, api)
 }
 
 function findExecutable(discoveryPath) {
@@ -445,19 +818,34 @@ function main(context) {
       (previous, current) => {
         clearTimeout(debounceUpdate)
         debounceUpdate = setTimeout(() => {
-          debouncedUpdateArchiveList(previous, current, context.api)
+          debouncedUpdateIniFiles(previous, current, context.api)
         }, 500);
       });
 
     // Deployments (manual "Apply" or automatic) don't change the profile, so the
     // onStateChange handler above never fires for them. Vortex emits "did-deploy"
     // (via emitAndAwait) once deployment has finished, which is our cue to refresh
-    // sResourceArchive2List so it always matches the enabled mods.
+    // both ini files - a deployment also restores HUDModLoader's own
+    // hudmodloader.ini, which still lists the mods we removed names for.
     context.api.onAsync('did-deploy', async (profileId) => {
       const state = context.api.store.getState();
       const profile = state.persistent.profiles[profileId];
       if (profile && (profile.gameId === GAME_ID)) {
-        await updateArchiveList(profile, context.api);
+        await updateManagedIniFiles(profile, context.api);
+      }
+    });
+
+    // HUDModLoader widget list (Data/hudmodloader.ini): remember which widget
+    // names an uninstalled mod needed, then remove them once the mod is gone.
+    context.api.events.on('will-remove-mod', (gameId, modId, removeOpts) =>
+      captureHudLinesForRemoval(gameId, modId, removeOpts, context.api));
+
+    context.api.events.on('did-remove-mod', (gameId) => {
+      if (gameId !== GAME_ID) return;
+      const profile = getActiveGameProfile(context.api.store.getState());
+      if (profile) {
+        updateHudModLoaderIni(profile, context.api)
+          .catch(err => log('error', `Error updating ${HUDMODLOADER_INI}`, err));
       }
     });
   });
@@ -510,4 +898,20 @@ module.exports = {
   default: main,
   // Exposed for the automated install-layout tests (test/); not used by Vortex.
   _installPaths: { sanitizeDestination, detectWrapperFolder, stripWrapperFolder },
+  // Exposed for the automated HUDModLoader tests (test/hudmodloader.test.js).
+  _hudModLoader: {
+    SETTING_HUDMODLOADER_PRUNED,
+    HUDMODLOADER_ENTRIES,
+    normalizeHudName,
+    getModNameCandidates,
+    hudLinesForMod,
+    getRequiredHudLines,
+    addHudLines,
+    removeHudLines,
+    reconcileHudLines,
+    getPrunedHudLines,
+    updateHudModLoaderIni,
+    captureHudLinesForRemoval,
+    getActiveGameProfile,
+  },
 };

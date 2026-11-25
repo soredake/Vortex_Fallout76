@@ -17,5 +17,5 @@ jobs:
       - name: Syntax check
         run: node --check index.js
 
-      - name: Run install-layout tests
-        run: node --test test/install-paths.test.js
+      - name: Run extension tests
+        run: node --test test/
